@@ -492,6 +492,24 @@ app.get("/addon-web-links.min.js", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "addon-web-links.min.js"));
 });
 
+// Serve a minimal SVG favicon for the OpenClaw Control UI which requests
+// these assets from the gateway but they are missing in openclaw@2026.3.13
+const OPENCLAW_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#e63c2f"/>
+  <text x="16" y="22" font-size="18" text-anchor="middle" fill="white" font-family="sans-serif">🦞</text>
+</svg>`;
+
+app.get("/openclaw/favicon.svg", (_req, res) => {
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.send(OPENCLAW_FAVICON_SVG);
+});
+app.get("/openclaw/favicon-32.png", (_req, res) => {
+  res.redirect("/openclaw/favicon.svg");
+});
+app.get("/openclaw/favicon-16.png", (_req, res) => {
+  res.redirect("/openclaw/favicon.svg");
+});
+
 app.get("/healthz", async (_req, res) => {
   let gateway = "unconfigured";
   if (isConfigured()) {
