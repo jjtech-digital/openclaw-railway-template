@@ -59,7 +59,7 @@ function writeLog(level, category, message) {
       const lines = content.split("\n");
       fs.writeFileSync(LOG_FILE, lines.slice(Math.floor(lines.length / 2)).join("\n"));
     }
-  } catch {}
+  } catch { }
 }
 
 const log = {
@@ -150,9 +150,12 @@ function isConfigured() {
 
 async function syncAllowedOrigins() {
   const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!publicDomain) return;
+  const port = process.env.PORT || "8080";
 
-  const origin = `https://${publicDomain}`;
+  const origins = publicDomain
+    ? [`https://${publicDomain}`]
+    : [`http://localhost:${port}`];
+
   const result = await runCmd(
     OPENCLAW_NODE,
     clawArgs([
@@ -160,11 +163,11 @@ async function syncAllowedOrigins() {
       "set",
       "--json",
       "gateway.controlUi.allowedOrigins",
-      JSON.stringify([origin]),
+      JSON.stringify(origins),
     ]),
   );
   if (result.code === 0) {
-    log.info("gateway", `set allowedOrigins to [${origin}]`);
+    log.info("gateway", `set allowedOrigins to [${origins.join(", ")}]`);
   } else {
     log.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
   }
@@ -227,8 +230,9 @@ async function startGateway() {
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
     "token",
-    "--token",
-    OPENCLAW_GATEWAY_TOKEN,
+    // --token omitted: OPENCLAW_GATEWAY_TOKEN is already in the child process
+    // environment (inherited from process.env), so the CLI reads it from env
+    // without exposing it in /proc/<pid>/cmdline.
     "--allow-unconfigured",
   ];
 
@@ -241,10 +245,7 @@ async function startGateway() {
     },
   });
 
-  const safeArgs = args.map((arg, i) =>
-    args[i - 1] === "--token" ? "[REDACTED]" : arg
-  );
-  log.info("gateway", `starting with command: ${OPENCLAW_NODE} ${clawArgs(safeArgs).join(" ")}`);
+  log.info("gateway", `starting with command: ${OPENCLAW_NODE} ${clawArgs(args).join(" ")}`);
   log.info("gateway", `STATE_DIR: ${STATE_DIR}`);
   log.info("gateway", `WORKSPACE_DIR: ${WORKSPACE_DIR}`);
   log.info("gateway", `config path: ${configPath()}`);
@@ -313,7 +314,10 @@ async function restartGateway() {
 const setupRateLimiter = {
   attempts: new Map(),
   windowMs: 60_000,
-  maxAttempts: 50,
+  // Only failed password attempts count — not normal page loads or API calls.
+  // This prevents legitimate usage from triggering 429 while still blocking
+  // brute-force attacks after 10 wrong passwords per minute.
+  maxFailures: 10,
   cleanupInterval: setInterval(function () {
     const now = Date.now();
     for (const [ip, data] of setupRateLimiter.attempts) {
@@ -323,17 +327,35 @@ const setupRateLimiter = {
     }
   }, 60_000),
 
-  isRateLimited(ip) {
+  // Returns true if this IP has too many recent failures.
+  isBlocked(ip) {
+    const now = Date.now();
+    const data = this.attempts.get(ip);
+    if (!data || now - data.windowStart > this.windowMs) return false;
+    return data.count >= this.maxFailures;
+  },
+
+  // Call only when a password check fails.
+  recordFailure(ip) {
     const now = Date.now();
     const data = this.attempts.get(ip);
     if (!data || now - data.windowStart > this.windowMs) {
       this.attempts.set(ip, { windowStart: now, count: 1 });
-      return false;
+    } else {
+      data.count++;
     }
-    data.count++;
-    return data.count > this.maxAttempts;
   },
 };
+
+// Extracts the real client IP, validating the X-Forwarded-For value so it
+// cannot be spoofed to an arbitrary string. With trust proxy=1, Express has
+// already resolved req.ip to the first X-Forwarded-For entry added by the
+// Railway proxy — we just normalise the fallback chain here.
+function getClientIp(req) {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  // Strip IPv6-mapped IPv4 prefix (::ffff:1.2.3.4 → 1.2.3.4)
+  return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+}
 
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
@@ -345,8 +367,8 @@ function requireSetupAuth(req, res, next) {
       );
   }
 
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
-  if (setupRateLimiter.isRateLimited(ip)) {
+  const ip = getClientIp(req);
+  if (setupRateLimiter.isBlocked(ip)) {
     return res.status(429).type("text/plain").send("Too many requests. Try again later.");
   }
 
@@ -363,18 +385,111 @@ function requireSetupAuth(req, res, next) {
   const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
   const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
   if (!isValid) {
+    // Only failed password attempts count toward rate limiting.
+    setupRateLimiter.recordFailure(ip);
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
+
+  // CSRF check: for state-mutating methods, verify the request originates
+  // from the same host. Browsers cache Basic auth credentials for the session,
+  // so a cross-origin page could trigger these endpoints silently.
+  // Uses strict host comparison (not .includes) to prevent bypasses like
+  // evil.com?target.com or evil-target.com passing the check.
+  if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
+    const rawOrigin = req.headers.origin || req.headers.referer || "";
+    const host = req.headers.host || "";
+    if (rawOrigin && host) {
+      let originHost = null;
+      try {
+        originHost = new URL(rawOrigin).host;
+      } catch {
+        // Malformed origin — reject
+        return res.status(403).json({ ok: false, error: "CSRF check failed" });
+      }
+      if (originHost !== host) {
+        return res.status(403).json({ ok: false, error: "CSRF check failed" });
+      }
+    }
+  }
+
   return next();
+}
+
+// Redact secrets from CLI output before returning it to the client.
+// Covers tokens, API keys, and the setup password.
+function redactSecrets(text) {
+  if (!text) return text;
+  let out = text;
+  // Redact the gateway token (64-char hex)
+  if (OPENCLAW_GATEWAY_TOKEN) {
+    out = out.split(OPENCLAW_GATEWAY_TOKEN).join("[REDACTED_TOKEN]");
+  }
+  // Redact the setup password
+  if (SETUP_PASSWORD) {
+    out = out.split(SETUP_PASSWORD).join("[REDACTED_PASSWORD]");
+  }
+  // Redact common API key patterns (Bearer / sk- / key- style)
+  out = out.replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/g, "Bearer [REDACTED]");
+  out = out.replace(/\b(sk-[A-Za-z0-9]{16,})/g, "[REDACTED_API_KEY]");
+  return out;
 }
 
 const app = express();
 app.disable("x-powered-by");
+// Trust exactly one proxy hop (Railway's load balancer) so req.ip reflects
+// the real client IP from X-Forwarded-For rather than the proxy's IP.
+app.set("trust proxy", 1);
+
+// Security headers for all /setup/* and /logs/* responses.
+// The gateway proxy routes are intentionally excluded (different CSP needs).
+app.use((req, res, next) => {
+  if (req.path.startsWith("/setup") || req.path.startsWith("/logs") || req.path.startsWith("/tui")) {
+    res.set("X-Content-Type-Options", "nosniff");
+    res.set("X-Frame-Options", "DENY");
+    res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.set(
+      "Content-Security-Policy",
+      [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "connect-src 'self' ws: wss: https:",
+        "img-src 'self' data: https:",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join("; ")
+    );
+    // HSTS: 1 year, including subdomains (Railway serves over HTTPS)
+    if (req.secure || req.headers["x-forwarded-proto"] === "https") {
+      res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+  }
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
+});
+
+app.get("/alpine.min.js", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "alpine.min.js"));
+});
+app.get("/xterm.min.css", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "xterm.min.css"));
+});
+app.get("/xterm.min.js", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "xterm.min.js"));
+});
+app.get("/addon-fit.min.js", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "addon-fit.min.js"));
+});
+app.get("/addon-web-links.min.js", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "addon-web-links.min.js"));
 });
 
 app.get("/healthz", async (_req, res) => {
@@ -385,7 +500,7 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, gateway });
 });
 
-app.get("/setup/healthz", async (_req, res) => {
+app.get("/setup/healthz", requireSetupAuth, async (_req, res) => {
   const configured = isConfigured();
   const gatewayRunning = isGatewayReady();
   const starting = isGatewayStarting();
@@ -398,7 +513,7 @@ app.get("/setup/healthz", async (_req, res) => {
       const r = await fetch(`${GATEWAY_TARGET}/`, { signal: controller.signal });
       clearTimeout(timeout);
       gatewayReachable = r !== null;
-    } catch {}
+    } catch { }
   }
 
   res.json({
@@ -525,6 +640,24 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   });
 });
 
+// Maps each authChoice to the environment variable the CLI reads for that secret.
+// Secrets are passed via env vars instead of CLI args to prevent exposure in
+// /proc/<pid>/cmdline on Linux.
+const AUTH_SECRET_ENV_MAP = {
+  "openai-api-key": "OPENAI_API_KEY",
+  apiKey: "ANTHROPIC_API_KEY",
+  "openrouter-api-key": "OPENROUTER_API_KEY",
+  "ai-gateway-api-key": "AI_GATEWAY_API_KEY",
+  "moonshot-api-key": "MOONSHOT_API_KEY",
+  "kimi-code-api-key": "KIMI_CODE_API_KEY",
+  "gemini-api-key": "GEMINI_API_KEY",
+  "zai-api-key": "ZAI_API_KEY",
+  "minimax-api": "MINIMAX_API_KEY",
+  "minimax-api-lightning": "MINIMAX_API_KEY",
+  "synthetic-api-key": "SYNTHETIC_API_KEY",
+  "opencode-zen": "OPENCODE_ZEN_API_KEY",
+};
+
 function buildOnboardArgs(payload) {
   const args = [
     "onboard",
@@ -541,48 +674,41 @@ function buildOnboardArgs(payload) {
     String(INTERNAL_GATEWAY_PORT),
     "--gateway-auth",
     "token",
-    "--gateway-token",
-    OPENCLAW_GATEWAY_TOKEN,
+    // --gateway-token omitted: OPENCLAW_GATEWAY_TOKEN is already in the
+    // child process environment (set at line 94), so the CLI picks it up
+    // from env without exposing it in the process argument list.
     "--flow",
     "quickstart",
   ];
 
   if (payload.authChoice) {
     args.push("--auth-choice", payload.authChoice);
-
-    const secret = (payload.authSecret || "").trim();
-    const map = {
-      "openai-api-key": "--openai-api-key",
-      apiKey: "--anthropic-api-key",
-      "openrouter-api-key": "--openrouter-api-key",
-      "ai-gateway-api-key": "--ai-gateway-api-key",
-      "moonshot-api-key": "--moonshot-api-key",
-      "kimi-code-api-key": "--kimi-code-api-key",
-      "gemini-api-key": "--gemini-api-key",
-      "zai-api-key": "--zai-api-key",
-      "minimax-api": "--minimax-api-key",
-      "minimax-api-lightning": "--minimax-api-key",
-      "synthetic-api-key": "--synthetic-api-key",
-      "opencode-zen": "--opencode-zen-api-key",
-    };
-    const flag = map[payload.authChoice];
-    if (flag && secret) {
-      args.push(flag, secret);
-    }
-
+    // Secret is NOT pushed as a CLI arg here — it is injected via extraEnv
+    // in the runCmd call below so it never appears in /proc/<pid>/cmdline.
   }
 
   return args;
 }
 
+function buildOnboardSecretEnv(payload) {
+  const secret = (payload.authSecret || "").trim();
+  const envVar = AUTH_SECRET_ENV_MAP[payload.authChoice];
+  if (envVar && secret) {
+    return { [envVar]: secret };
+  }
+  return {};
+}
+
 function runCmd(cmd, args, opts = {}) {
+  const { extraEnv, ...spawnOpts } = opts;
   return new Promise((resolve) => {
     const proc = childProcess.spawn(cmd, args, {
-      ...opts,
+      ...spawnOpts,
       env: {
         ...process.env,
         OPENCLAW_STATE_DIR: STATE_DIR,
         OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+        ...(extraEnv || {}),
       },
     });
 
@@ -596,6 +722,15 @@ function runCmd(cmd, args, opts = {}) {
     });
 
     proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
+
+    // Write to stdin if provided (used to pass secrets without exposing them
+    // in process args / /proc/<pid>/cmdline).
+    if (opts.stdinData !== undefined) {
+      try {
+        proc.stdin?.write(opts.stdinData);
+        proc.stdin?.end();
+      } catch { }
+    }
   });
 }
 
@@ -618,7 +753,7 @@ const VALID_AUTH_CHOICES = [
 ];
 
 function validatePayload(payload) {
-if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
+  if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     return `Invalid authChoice: ${payload.authChoice}`;
   }
   const stringFields = [
@@ -657,7 +792,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       return res.status(400).json({ ok: false, output: validationError });
     }
     const onboardArgs = buildOnboardArgs(payload);
-    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+    const onboardSecretEnv = buildOnboardSecretEnv(payload);
+    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs), { extraEnv: onboardSecretEnv });
 
     let extra = "";
     extra += `\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`;
@@ -702,10 +838,14 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
 
       if (payload.model?.trim()) {
-        extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
+        const model = payload.model.trim();
+        if (!/^[a-zA-Z0-9._\/-]{1,128}$/.test(model)) {
+          return res.status(400).json({ ok: false, output: "Invalid model format" });
+        }
+        extra += `[setup] Setting model to ${model}...\n`;
         const modelResult = await runCmd(
           OPENCLAW_NODE,
-          clawArgs(["models", "set", payload.model.trim()]),
+          clawArgs(["models", "set", model]),
         );
         extra += `[models set] exit=${modelResult.code}\n${modelResult.output || ""}`;
       }
@@ -765,7 +905,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     return res.status(ok ? 200 : 500).json({
       ok,
-      output: `${onboard.output}${extra}`,
+      output: redactSecrets(`${onboard.output}${extra}`),
     });
   } catch (err) {
     log.error("setup", `run error: ${String(err)}`);
@@ -810,13 +950,20 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
       .status(400)
       .json({ ok: false, error: "Missing channel or code" });
   }
+  const VALID_PAIRING_CHANNELS = ["telegram", "discord", "slack"];
+  if (!VALID_PAIRING_CHANNELS.includes(String(channel))) {
+    return res.status(400).json({ ok: false, error: "Invalid channel" });
+  }
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(String(code))) {
+    return res.status(400).json({ ok: false, error: "Invalid code format" });
+  }
   const r = await runCmd(
     OPENCLAW_NODE,
     clawArgs(["pairing", "approve", String(channel), String(code)]),
   );
   return res
     .status(r.code === 0 ? 200 : 500)
-    .json({ ok: r.code === 0, output: r.output });
+    .json({ ok: r.code === 0, output: redactSecrets(r.output) });
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
@@ -835,26 +982,26 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
   const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
   return res.status(result.code === 0 ? 200 : 500).json({
     ok: result.code === 0,
-    output: result.output,
+    output: redactSecrets(result.output),
   });
 });
 
 app.get("/setup/api/devices", requireSetupAuth, async (_req, res) => {
   const args = ["devices", "list", "--json", "--token", OPENCLAW_GATEWAY_TOKEN];
   const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
-  log.info("devices", `list exit=${result.code} output=${result.output}`);
+  log.info("devices", `list exit=${result.code} output=${redactSecrets(result.output)}`);
   try {
     const jsonMatch = result.output.match(/(\{[\s\S]*\}|\[[\s\S]*\])\s*$/);
     if (!jsonMatch) {
       log.warn("devices", "no JSON found in output");
-      return res.json({ ok: result.code === 0, raw: result.output });
+      return res.json({ ok: result.code === 0, raw: redactSecrets(result.output) });
     }
     const data = JSON.parse(jsonMatch[1]);
     log.info("devices", `parsed keys=${Object.keys(data)} pending=${JSON.stringify(data.pending)} paired=${JSON.stringify(data.paired)}`);
-    return res.json({ ok: true, data, raw: result.output });
+    return res.json({ ok: true, data, raw: redactSecrets(result.output) });
   } catch (parseErr) {
     log.warn("devices", `JSON parse failed: ${parseErr.message}`);
-    return res.json({ ok: result.code === 0, raw: result.output });
+    return res.json({ ok: result.code === 0, raw: redactSecrets(result.output) });
   }
 });
 
@@ -862,7 +1009,10 @@ app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
   const { requestId } = req.body || {};
   const args = ["devices", "approve"];
   if (requestId) {
-    args.push(String(requestId));
+    if (typeof requestId !== "string" || requestId.startsWith("-") || !/^[a-zA-Z0-9_-]{1,128}$/.test(requestId)) {
+      return res.status(400).json({ ok: false, error: "Invalid requestId" });
+    }
+    args.push(requestId);
   } else {
     args.push("--latest");
   }
@@ -870,7 +1020,7 @@ app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
   const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
   return res
     .status(result.code === 0 ? 200 : 500)
-    .json({ ok: result.code === 0, output: result.output });
+    .json({ ok: result.code === 0, output: redactSecrets(result.output) });
 });
 
 app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
@@ -878,20 +1028,33 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
   if (!requestId) {
     return res.status(400).json({ ok: false, error: "Missing requestId" });
   }
+  if (typeof requestId !== "string" || requestId.startsWith("-") || !/^[a-zA-Z0-9_-]{1,128}$/.test(requestId)) {
+    return res.status(400).json({ ok: false, error: "Invalid requestId" });
+  }
   const args = [
-    "devices", "reject", String(requestId),
+    "devices", "reject", requestId,
     "--token", OPENCLAW_GATEWAY_TOKEN,
   ];
   const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
   return res
     .status(result.code === 0 ? 200 : 500)
-    .json({ ok: result.code === 0, output: result.output });
+    .json({ ok: result.code === 0, output: redactSecrets(result.output) });
 });
 
 app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const zipName = `openclaw-export-${timestamp}.zip`;
-  const tmpZip = path.join(os.tmpdir(), zipName);
+  // Two temp files: plain zip → AES-256 encrypted archive.
+  // The plain zip is created then immediately encrypted and deleted so
+  // unencrypted data is never streamed to the client.
+  const plainZipName = `openclaw-plain-${timestamp}.zip`;
+  const encName = `openclaw-export-${timestamp}.zip.enc`;
+  const plainZipPath = path.join(os.tmpdir(), plainZipName);
+  const encPath = path.join(os.tmpdir(), encName);
+
+  const cleanup = () => {
+    try { fs.rmSync(plainZipPath, { force: true }); } catch { }
+    try { fs.rmSync(encPath, { force: true }); } catch { }
+  };
 
   try {
     const dirsToExport = [];
@@ -902,34 +1065,51 @@ app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
       return res.status(404).json({ ok: false, error: "No data directories found to export." });
     }
 
-    const zipArgs = ["-r", "-P", SETUP_PASSWORD, tmpZip, ...dirsToExport];
-    const result = await runCmd("zip", zipArgs);
-
-    if (result.code !== 0 || !fs.existsSync(tmpZip)) {
-      return res.status(500).json({ ok: false, error: "Failed to create export archive.", output: result.output });
+    // Step 1: create unencrypted zip (no -P flag — password never touches args)
+    const zipResult = await runCmd("zip", ["-r", plainZipPath, ...dirsToExport]);
+    if (zipResult.code !== 0 || !fs.existsSync(plainZipPath)) {
+      cleanup();
+      return res.status(500).json({ ok: false, error: "Failed to create archive.", output: redactSecrets(zipResult.output) });
     }
 
-    const stat = fs.statSync(tmpZip);
+    // Step 2: encrypt with AES-256-CBC using openssl.
+    // Password is passed via stdin — never appears in /proc/<pid>/cmdline.
+    const sslArgs = [
+      "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000",
+      "-in", plainZipPath, "-out", encPath,
+      "-pass", "stdin",
+    ];
+    const encResult = await runCmd("openssl", sslArgs, { stdinData: SETUP_PASSWORD + "\n" });
+
+    // Plain zip no longer needed regardless of outcome
+    try { fs.rmSync(plainZipPath, { force: true }); } catch { }
+
+    if (encResult.code !== 0 || !fs.existsSync(encPath)) {
+      cleanup();
+      return res.status(500).json({ ok: false, error: "Failed to encrypt archive.", output: redactSecrets(encResult.output) });
+    }
+
+    const stat = fs.statSync(encPath);
     res.set({
-      "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${zipName}"`,
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${encName}"`,
       "Content-Length": String(stat.size),
     });
 
-    const stream = fs.createReadStream(tmpZip);
+    const stream = fs.createReadStream(encPath);
     stream.pipe(res);
     stream.on("end", () => {
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
+      try { fs.rmSync(encPath, { force: true }); } catch { }
     });
     stream.on("error", (err) => {
       log.error("export", `stream error: ${err.message}`);
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
+      cleanup();
       if (!res.headersSent) {
         res.status(500).json({ ok: false, error: "Stream error during export." });
       }
     });
   } catch (err) {
-    try { fs.rmSync(tmpZip, { force: true }); } catch {}
+    cleanup();
     log.error("export", `error: ${err.message}`);
     return res.status(500).json({ ok: false, error: `Export failed: ${err.message}` });
   }
@@ -1099,7 +1279,7 @@ function createTuiWebSocketServer(httpServer) {
       if (ptyProcess) {
         try {
           ptyProcess.kill();
-        } catch {}
+        } catch { }
       }
       activeTuiSession = null;
     });
@@ -1139,7 +1319,19 @@ proxy.on("error", (err, _req, res) => {
 
 const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-  : GATEWAY_TARGET;
+  : `http://localhost:${PORT}`;
+
+proxy.on("proxyRes", (proxyRes) => {
+  const csp = proxyRes.headers["content-security-policy"];
+  if (csp && !csp.includes("font-src")) {
+    proxyRes.headers["content-security-policy"] = csp + "; font-src 'self' data: https://fonts.gstatic.com";
+  } else if (csp && !csp.includes("data:")) {
+    proxyRes.headers["content-security-policy"] = csp.replace(
+      /font-src([^;]*)/,
+      "font-src$1 data:"
+    );
+  }
+});
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
   if (!req.url?.startsWith("/hooks/")) {
@@ -1176,10 +1368,6 @@ app.use(async (req, res) => {
     }
   }
 
-  if (req.path === "/openclaw" && !req.query.token) {
-    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
-  }
-
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1195,7 +1383,7 @@ const server = app.listen(PORT, () => {
         log.info("wrapper", "running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
         log.info("wrapper", `doctor --fix exit=${dr.code}`);
-        if (dr.output) log.info("wrapper", dr.output);
+        if (dr.output) log.info("wrapper", redactSecrets(dr.output));
       } catch (err) {
         log.warn("wrapper", `doctor --fix failed: ${err.message}`);
       }
@@ -1218,7 +1406,15 @@ server.on("upgrade", async (req, socket, head) => {
       return;
     }
 
+    const ip = getClientIp(req);
+    if (setupRateLimiter.isBlocked(ip)) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
     if (!verifyTuiAuth(req)) {
+      setupRateLimiter.recordFailure(ip);
       socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw TUI\"\r\n\r\n");
       socket.destroy();
       return;
@@ -1262,7 +1458,7 @@ async function gracefulShutdown(signal) {
     try {
       activeTuiSession.ws.close(1001, "Server shutting down");
       activeTuiSession.pty.kill();
-    } catch {}
+    } catch { }
     activeTuiSession = null;
   }
 
