@@ -34,7 +34,13 @@
       isReady: false,
       tuiEnabled: false,
       exporting: false,
+      importing: false,
       showExportInfo: false,
+      showBackupsModal: false,
+      backupsLoading: false,
+      backups: [],
+      creatingBackup: false,
+      restoringBackup: null,
       showDevicesModal: false,
       devicesLoading: false,
       devices: [],
@@ -330,6 +336,98 @@
         }
       },
 
+      async openBackupsModal() {
+        this.showBackupsModal = true;
+        await this.loadBackups();
+      },
+
+      async loadBackups() {
+        this.backupsLoading = true;
+        try {
+          const j = await this.httpJson('/setup/api/backups');
+          this.backups = j.backups || [];
+        } catch (e) {
+          this.log += '✗ Failed to load backups: ' + String(e) + '\n';
+        } finally {
+          this.backupsLoading = false;
+        }
+      },
+
+      async createManualBackup() {
+        this.creatingBackup = true;
+        try {
+          const res = await fetch('/setup/api/backup', { method: 'POST', credentials: 'same-origin' });
+          const j = await res.json();
+          if (j.ok) {
+            this.log += '✓ Backup created: ' + j.backup + '\n';
+          } else {
+            this.log += '✗ Backup failed: ' + (j.error || 'Unknown error') + '\n';
+          }
+          await this.loadBackups();
+        } catch (e) {
+          this.log += '✗ Error: ' + String(e) + '\n';
+        } finally {
+          this.creatingBackup = false;
+        }
+      },
+
+      async restoreFromBackup(backupId) {
+        if (!confirm('Restore from backup "' + backupId + '"? A backup of the current config will be saved first.')) return;
+        this.restoringBackup = backupId;
+        try {
+          const res = await fetch('/setup/api/restore', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ backupId })
+          });
+          const j = await res.json();
+          if (j.ok) {
+            this.log += '✓ Restored from: ' + backupId + '\n';
+            await this.refreshStatus();
+          } else {
+            this.log += '✗ Restore failed: ' + (j.error || 'Unknown error') + '\n';
+          }
+          await this.loadBackups();
+        } catch (e) {
+          this.log += '✗ Error: ' + String(e) + '\n';
+        } finally {
+          this.restoringBackup = null;
+        }
+      },
+
+      async importData() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.zip';
+        input.onchange = async () => {
+          const file = input.files[0];
+          if (!file) return;
+          this.importing = true;
+          this.log = 'Importing ' + file.name + '...\n';
+          try {
+            const res = await fetch('/setup/api/import', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/zip' },
+              body: file
+            });
+            const j = await res.json();
+            if (j.ok) {
+              this.log += '✓ ' + (j.message || 'Import successful') + '\n';
+              await this.refreshStatus();
+            } else {
+              this.log += '✗ Import failed: ' + (j.error || 'Unknown error') + '\n';
+            }
+          } catch (e) {
+            this.log += '✗ Import error: ' + String(e) + '\n';
+          } finally {
+            this.importing = false;
+          }
+        };
+        input.click();
+      },
+
     }));
   });
   </script>
@@ -446,6 +544,36 @@
             </button>
           </div>
 
+          <div class="action-card action-sky">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+              </div>
+              <span class="action-title">Import Data</span>
+            </div>
+            <p class="action-desc">Restore from a previously exported ZIP file. Current config is backed up first.</p>
+            <button @click="importData()" :disabled="loading || importing" class="action-btn">
+              <span x-show="!importing">Import Data</span>
+              <span x-show="importing" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem">
+                <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                Importing...
+              </span>
+            </button>
+          </div>
+
+          <div class="action-card action-violet">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              </div>
+              <span class="action-title">Manage Backups</span>
+            </div>
+            <p class="action-desc">View, create, and restore from automatic or manual config backups.</p>
+            <button @click="openBackupsModal()" :disabled="loading" class="action-btn">
+              Manage Backups
+            </button>
+          </div>
+
           <div class="action-card action-blue">
             <div class="action-card-header">
               <div class="action-icon">
@@ -465,11 +593,11 @@
 
       <div class="danger-card">
         <h3 class="danger-title">Danger Zone</h3>
-        <p class="text-muted text-sm mb-4">Destructive actions that cannot be undone</p>
+        <p class="text-muted text-sm mb-4">Reset creates a backup automatically before deleting config</p>
         <div class="danger-row">
           <div>
             <p class="danger-row-title">Reset Setup</p>
-            <p class="danger-row-desc">Deletes the config file so you can run onboarding again from scratch.</p>
+            <p class="danger-row-desc">Backs up current config, then deletes it so you can run onboarding again.</p>
           </div>
           <button @click="resetSetup()" :disabled="loading" class="danger-btn shrink-0">
             Reset Setup
@@ -748,6 +876,57 @@
         <div class="btn-pair">
           <button @click="approvePairing()" class="btn btn-primary">Approve</button>
           <button @click="showPairingModal = false" class="btn btn-close-full" style="margin-top:0">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div x-show="showBackupsModal" x-cloak class="modal-overlay" @click.self="showBackupsModal = false">
+      <div class="modal-card modal-lg">
+        <div class="modal-header">
+          <h3 class="modal-title">Config Backups</h3>
+          <div class="modal-actions">
+            <button @click="loadBackups()" :disabled="backupsLoading" class="btn-icon">
+              <svg class="icon-sm" :class="backupsLoading && 'spinning'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            </button>
+            <button @click="showBackupsModal = false" class="btn-icon">
+              <svg class="icon-sm" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <p class="modal-desc">Backups are created automatically before resets, restores, and imports. You can also create manual backups.</p>
+
+        <button @click="createManualBackup()" :disabled="creatingBackup" class="btn-violet mb-4">
+          <span x-show="!creatingBackup">Create Backup Now</span>
+          <span x-show="creatingBackup" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem">
+            <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+            Creating...
+          </span>
+        </button>
+
+        <div class="section-block">
+          <h4 class="section-heading">Available Backups</h4>
+          <div x-show="backups.length === 0 && !backupsLoading" class="empty-state">No backups yet</div>
+          <div class="device-list">
+            <template x-for="b in backups" :key="b.id">
+              <div class="device-pending">
+                <div class="min-w-0 flex-1">
+                  <p class="device-pending-id" style="word-break:break-all" x-text="b.id"></p>
+                  <p class="device-pending-date">
+                    <span x-text="b.reason" style="text-transform:capitalize"></span>
+                    <span x-show="b.created"> &mdash; <span x-text="b.created ? new Date(b.created).toLocaleString() : ''"></span></span>
+                    <span x-show="b.files.length"> &mdash; <span x-text="b.files.length + ' files'"></span></span>
+                  </p>
+                </div>
+                <div class="device-actions">
+                  <button @click="restoreFromBackup(b.id)" :disabled="restoringBackup !== null" class="btn-emerald">
+                    <span x-show="restoringBackup !== b.id">Restore</span>
+                    <span x-show="restoringBackup === b.id">Restoring...</span>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </div>
         </div>
       </div>
     </div>
