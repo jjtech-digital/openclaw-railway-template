@@ -2,7 +2,7 @@
 
 Deploy OpenClaw on Railway with a browser-first setup flow. No SSH required for onboarding.
 
-IF YOU ARE UPGRADING FROM A PREVIOW VERSION REMOVE THE ENV VAR 'OPENCLAW_ENTRY' AS NOW OPENCLAW IS INSTALLED VIA NPM
+**Upgrading?** Remove the `OPENCLAW_ENTRY` env var -- OpenClaw is now installed via npm.
 
 ## Read This First
 
@@ -20,6 +20,9 @@ This template exposes your OpenClaw gateway to the public internet.
 - Persistent state on Railway volume (`/data`)
 - Health endpoint at `/healthz`
 - Diagnostics and logs via setup tools + `/logs`
+- Config backup, restore, export, and import
+- Device pairing management from the setup wizard
+- Debug console for running diagnostic commands
 
 ## Quick Start (Railway)
 
@@ -60,7 +63,8 @@ This template exposes your OpenClaw gateway to the public internet.
 - Run onboarding once
 - Verify `/healthz` returns `{ "ok": true, ... }`
 - Open `/openclaw` via setup link
-- If using Telegram/Discord, approve pending devices from setup tools
+- If using Telegram/Discord, approve pending devices from the Devices panel in `/setup`
+- Create a manual backup from the Backups panel (good practice before going live)
 
 ## Chat Token Prep
 
@@ -77,6 +81,29 @@ This template exposes your OpenClaw gateway to the public internet.
 2. Add bot + copy bot token
 3. Invite bot to server (`bot`, `applications.commands` scopes)
 4. Enable required intents for your use case
+
+## Backup & Restore
+
+The setup wizard includes a full backup and restore system for your OpenClaw configuration.
+
+**Automatic backups** are created before destructive actions (reset, restore, import). On startup, if the config file is corrupted, the wrapper automatically restores from the latest backup.
+
+**Manual backups** can be created from the Backups panel in `/setup`. Up to 10 backups are retained; older ones are pruned automatically.
+
+### Export / Import
+
+- **Export**: Download a password-protected ZIP of your config and gateway token from `/setup` (Tools > Export Data).
+- **Import**: Upload a previously exported ZIP via `/setup` (Tools > Import Data). A backup is created before overwriting.
+
+This is useful for migrating between Railway instances or keeping an off-site copy of your configuration.
+
+## Device Management
+
+Manage paired devices directly from `/setup` (Tools > Manage Devices). You can view pending and approved devices, and approve or reject pairing requests without needing SSH access.
+
+## Debug Console
+
+The setup wizard includes a debug console (Tools > Debug Console) for running pre-approved diagnostic commands against the OpenClaw CLI. Commands include checking config values, listing devices, running doctor, and more.
 
 ## Web TUI (`/tui`)
 
@@ -113,18 +140,24 @@ docker run --rm -p 8080:8080 \
 ### Control UI says disconnected / auth error
 
 - Open `/setup` first, then click the OpenClaw UI link from there.
-- Approve pending devices in setup if pairing is required.
+- Approve pending devices from the Devices panel in `/setup`.
 
 ### 502 / gateway unavailable
 
 - Check `/healthz`
-- Run doctor from setup (`openclaw doctor --repair`)
+- Run `openclaw doctor --repair` from the debug console in `/setup`
 - Verify `/data` volume is mounted and writable
 
 ### Setup keeps resetting after redeploy
 
 - `OPENCLAW_STATE_DIR` or `OPENCLAW_WORKSPACE_DIR` is not on `/data`
 - Fix both vars and redeploy
+
+### Config corrupted after crash
+
+- The wrapper auto-restores from the latest backup on startup
+- If auto-restore fails, use the Backups panel in `/setup` to manually restore
+- If no backups exist, use Reset Setup to start fresh (or import a previously exported ZIP)
 
 ### TUI not visible
 
@@ -133,10 +166,14 @@ docker run --rm -p 8080:8080 \
 
 ## Useful Endpoints
 
-- `/setup` - onboarding + management
-- `/openclaw` - Control UI
-- `/healthz` - public health
-- `/logs` - live server logs UI
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `/setup` | Basic auth | Onboarding wizard, config tools, backups, devices |
+| `/openclaw` | Auto-injected | OpenClaw Control UI |
+| `/healthz` | None | Public health check |
+| `/setup/healthz` | None | Setup-specific health check |
+| `/logs` | Basic auth | Live server logs viewer |
+| `/tui` | Basic auth | Browser terminal (if enabled) |
 
 ## Support
 
