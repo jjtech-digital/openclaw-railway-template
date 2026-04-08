@@ -381,7 +381,7 @@ Before submitting a PR:
 - Template must mount a volume at `/data`
 - Must set `SETUP_PASSWORD` in Railway Variables
 - Public networking must be enabled (assigns `*.up.railway.app` domain)
-- OpenClaw is installed via `npm install -g openclaw@2026.3.13 clawhub@latest` during Docker build
+- OpenClaw is installed via `npm install -g openclaw@2026.4.8 clawhub@latest` during Docker build
 - Homebrew is installed for additional CLI tools (git, curl, etc.) and persisted to volume
 - Health check configured to `/setup/healthz` endpoint
 

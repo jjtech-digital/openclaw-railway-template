@@ -12,7 +12,8 @@ RUN apt-get update \
     zip \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g openclaw@2026.3.13 clawhub@0.9.0
+
+RUN npm install -g openclaw@2026.4.8 clawhub@latest
 
 # Backward-compatibility shim for older OPENCLAW_ENTRY values.
 RUN mkdir -p /openclaw \
