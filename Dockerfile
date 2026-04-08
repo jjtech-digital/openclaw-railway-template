@@ -12,6 +12,7 @@ RUN apt-get update \
     zip \
   && rm -rf /var/lib/apt/lists/*
 
+
 RUN npm install -g openclaw@2026.4.8 clawhub@latest
 
 # Backward-compatibility shim for older OPENCLAW_ENTRY values.
@@ -44,7 +45,7 @@ ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD curl -f http://localhost:8080/setup/healthz || exit 1
+  CMD curl -f http://localhost:8080/healthz || exit 1
 
 USER root
 ENTRYPOINT ["./entrypoint.sh"]
