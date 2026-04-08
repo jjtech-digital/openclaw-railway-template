@@ -93,6 +93,152 @@ function resolveGatewayToken() {
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
+/* ── Config backup manager ────────────────────────────────────────── */
+
+const BACKUP_DIR = path.join(STATE_DIR, "backups");
+const MAX_BACKUPS = 10;
+
+function createBackup(reason = "manual") {
+  try {
+    const cfgPath = configPath();
+    if (!fs.existsSync(cfgPath)) {
+      log.warn("backup", "nothing to back up — no config file");
+      return null;
+    }
+
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const name = `${ts}_${reason}`;
+    const dir = path.join(BACKUP_DIR, name);
+    fs.mkdirSync(dir, { recursive: true });
+
+    fs.copyFileSync(cfgPath, path.join(dir, "openclaw.json"));
+
+    const tokenPath = path.join(STATE_DIR, "gateway.token");
+    if (fs.existsSync(tokenPath)) {
+      fs.copyFileSync(tokenPath, path.join(dir, "gateway.token"));
+    }
+
+    const manifest = {
+      created: new Date().toISOString(),
+      reason,
+      files: fs.readdirSync(dir),
+    };
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+
+    log.info("backup", `created: ${name} (${manifest.files.length} files)`);
+    pruneBackups();
+    return name;
+  } catch (err) {
+    log.error("backup", `create failed: ${err.message}`);
+    return null;
+  }
+}
+
+function listBackups() {
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) return [];
+    return fs
+      .readdirSync(BACKUP_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => {
+        const manifestPath = path.join(BACKUP_DIR, d.name, "manifest.json");
+        let manifest = {};
+        try {
+          manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        } catch {}
+        return {
+          id: d.name,
+          created: manifest.created || null,
+          reason: manifest.reason || "unknown",
+          files: manifest.files || [],
+        };
+      })
+      .sort((a, b) => (b.id > a.id ? 1 : -1));
+  } catch {
+    return [];
+  }
+}
+
+function restoreBackup(backupId) {
+  const dir = path.join(BACKUP_DIR, backupId);
+  if (!fs.existsSync(dir)) {
+    return { ok: false, error: "Backup not found" };
+  }
+
+  const cfgSrc = path.join(dir, "openclaw.json");
+  if (!fs.existsSync(cfgSrc)) {
+    return { ok: false, error: "Backup missing openclaw.json" };
+  }
+
+  try {
+    JSON.parse(fs.readFileSync(cfgSrc, "utf8"));
+  } catch {
+    return { ok: false, error: "Backup contains invalid JSON config" };
+  }
+
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.copyFileSync(cfgSrc, configPath());
+
+    const tokenSrc = path.join(dir, "gateway.token");
+    if (fs.existsSync(tokenSrc)) {
+      fs.copyFileSync(tokenSrc, path.join(STATE_DIR, "gateway.token"));
+      try {
+        fs.chmodSync(path.join(STATE_DIR, "gateway.token"), 0o600);
+      } catch {}
+    }
+
+    log.info("backup", `restored from: ${backupId}`);
+    return { ok: true, backupId };
+  } catch (err) {
+    log.error("backup", `restore failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+function pruneBackups() {
+  const backups = listBackups();
+  if (backups.length <= MAX_BACKUPS) return;
+
+  const toRemove = backups.slice(MAX_BACKUPS);
+  for (const b of toRemove) {
+    try {
+      fs.rmSync(path.join(BACKUP_DIR, b.id), { recursive: true, force: true });
+      log.info("backup", `pruned old backup: ${b.id}`);
+    } catch {}
+  }
+}
+
+function verifyConfigIntegrity() {
+  const cfgPath = configPath();
+  if (!fs.existsSync(cfgPath)) return;
+
+  try {
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    JSON.parse(raw);
+    log.info("startup", "config integrity check passed");
+  } catch (err) {
+    log.error("startup", `config corrupted: ${err.message} — attempting auto-restore`);
+    const backups = listBackups();
+    if (backups.length === 0) {
+      log.error("startup", "no backups available for auto-restore");
+      return;
+    }
+    const latest = backups[0];
+    const result = restoreBackup(latest.id);
+    if (result.ok) {
+      log.info("startup", `auto-restored from backup: ${latest.id}`);
+    } else {
+      log.error("startup", `auto-restore failed: ${result.error}`);
+    }
+  }
+}
+
+verifyConfigIntegrity();
+
+/* ── End backup manager ───────────────────────────────────────────── */
+
 let cachedOpenclawVersion = null;
 let cachedChannelsHelp = null;
 
@@ -821,10 +967,11 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   try {
+    createBackup("pre-reset");
     fs.rmSync(configPath(), { force: true });
     res
       .type("text/plain")
-      .send("OK - deleted config file. You can rerun setup now.");
+      .send("OK - deleted config file (backup saved). You can rerun setup now.");
   } catch (err) {
     res.status(500).type("text/plain").send(String(err));
   }
@@ -838,6 +985,135 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
     output: result.output,
   });
 });
+
+/* ── Backup / restore / import endpoints ───────────────────────── */
+
+app.get("/setup/api/backups", requireSetupAuth, (_req, res) => {
+  res.json({ ok: true, backups: listBackups() });
+});
+
+app.post("/setup/api/backup", requireSetupAuth, (_req, res) => {
+  const name = createBackup("manual");
+  if (name) {
+    res.json({ ok: true, backup: name });
+  } else {
+    res.status(400).json({ ok: false, error: "Nothing to back up (no config file)" });
+  }
+});
+
+app.post("/setup/api/restore", requireSetupAuth, async (req, res) => {
+  const { backupId } = req.body || {};
+  if (!backupId || typeof backupId !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing backupId" });
+  }
+  if (backupId.includes("..") || backupId.includes("/") || backupId.includes("\\")) {
+    return res.status(400).json({ ok: false, error: "Invalid backupId" });
+  }
+
+  createBackup("pre-restore");
+  const result = restoreBackup(backupId);
+  if (result.ok) {
+    try {
+      await restartGateway();
+    } catch (err) {
+      log.warn("restore", `gateway restart after restore failed: ${err.message}`);
+    }
+  }
+  return res.status(result.ok ? 200 : 500).json(result);
+});
+
+app.post("/setup/api/import", requireSetupAuth, async (req, res) => {
+  const tmpDir = path.join(os.tmpdir(), `openclaw-import-${Date.now()}`);
+  try {
+    const contentType = req.headers["content-type"] || "";
+    if (!contentType.includes("application/zip") && !contentType.includes("octet-stream")) {
+      return res.status(400).json({ ok: false, error: "Expected a ZIP file (Content-Type: application/zip)" });
+    }
+
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const zipBuffer = Buffer.concat(chunks);
+    if (zipBuffer.length === 0) {
+      return res.status(400).json({ ok: false, error: "Empty upload" });
+    }
+    if (zipBuffer.length > 100 * 1024 * 1024) {
+      return res.status(413).json({ ok: false, error: "Upload too large (max 100MB)" });
+    }
+
+    const tmpZip = path.join(os.tmpdir(), `openclaw-import-${Date.now()}.zip`);
+    fs.writeFileSync(tmpZip, zipBuffer);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const password = req.headers["x-import-password"] || SETUP_PASSWORD;
+    const unzipResult = await runCmd("unzip", ["-o", "-P", password, tmpZip, "-d", tmpDir]);
+    try { fs.rmSync(tmpZip, { force: true }); } catch {}
+
+    if (unzipResult.code !== 0) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      return res.status(400).json({
+        ok: false,
+        error: "Failed to extract ZIP. Wrong password or corrupt file.",
+        output: unzipResult.output,
+      });
+    }
+
+    let importedConfig = null;
+    const findConfig = (dir) => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isFile() && e.name === "openclaw.json") return full;
+        if (e.isDirectory()) {
+          const found = findConfig(full);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    importedConfig = findConfig(tmpDir);
+
+    if (!importedConfig) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      return res.status(400).json({ ok: false, error: "No openclaw.json found in the archive" });
+    }
+
+    try {
+      JSON.parse(fs.readFileSync(importedConfig, "utf8"));
+    } catch {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      return res.status(400).json({ ok: false, error: "Imported openclaw.json contains invalid JSON" });
+    }
+
+    createBackup("pre-import");
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.copyFileSync(importedConfig, configPath());
+
+    const importedToken = path.join(path.dirname(importedConfig), "gateway.token");
+    if (fs.existsSync(importedToken)) {
+      fs.copyFileSync(importedToken, path.join(STATE_DIR, "gateway.token"));
+      try { fs.chmodSync(path.join(STATE_DIR, "gateway.token"), 0o600); } catch {}
+    }
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+
+    log.info("import", "config imported successfully");
+    try {
+      await restartGateway();
+    } catch (err) {
+      log.warn("import", `gateway restart after import failed: ${err.message}`);
+    }
+
+    return res.json({ ok: true, message: "Config imported and gateway restarted" });
+  } catch (err) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    log.error("import", `error: ${err.message}`);
+    return res.status(500).json({ ok: false, error: `Import failed: ${err.message}` });
+  }
+});
+
+/* ── End backup / restore / import ────────────────────────────── */
 
 app.get("/setup/api/devices", requireSetupAuth, async (_req, res) => {
   const args = ["devices", "list", "--json", "--token", OPENCLAW_GATEWAY_TOKEN];
